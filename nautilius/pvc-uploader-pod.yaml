@@ -1,7 +1,18 @@
+# nautilius/pvc-uploader-pod.yaml
+# Utility pod for uploading data to the PVC.
+#
+#   kubectl apply -f nautilius/pvc-uploader-pod.yaml -n gai-lina-group
+#   kubectl get pod brats23-uploader -n gai-lina-group -w   # wait for Running
+#
+# Copy data into PVC:
+#   kubectl cp ./data/ gai-lina-group/brats23-uploader:/pvc/data/
+#
+# Delete when done:
+#   kubectl delete pod brats23-uploader -n gai-lina-group
 apiVersion: v1
 kind: Pod
 metadata:
-  name: team-u16-mri-synth-script-uploader
+  name: brats23-uploader
   namespace: gai-lina-group
 spec:
   restartPolicy: Never
