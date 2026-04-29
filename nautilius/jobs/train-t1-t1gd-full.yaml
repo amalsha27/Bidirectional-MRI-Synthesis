@@ -1,0 +1,122 @@
+# =============================================================================
+# Training Job — T1 <-> T1Gd (full dataset, 100k iters)
+#
+#   kubectl apply -f nautilius/jobs/train-t1-t1gd-full.yaml -n gai-lina-group
+#   kubectl logs -f job/bidi-mri-train-t1-t1gd-full -n gai-lina-group
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bidi-mri-train-t1-t1gd-full
+  namespace: gai-lina-group
+  labels:
+    app: bidirectional-mri-synthesis
+    pair: t1-t1gd
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: bidirectional-mri-synthesis
+        pair: t1-t1gd
+    spec:
+      restartPolicy: Never
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-A40
+                - NVIDIA-GeForce-RTX-3090
+                - Tesla-V100-SXM2-32GB
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+
+      containers:
+        - name: trainer
+          image: ghcr.io/amalsha27/bidirectional-mri-synthesis:latest
+          imagePullPolicy: Always
+
+          command: ["python", "/app/scripts/train_option2.py"]
+          args:
+            - "--pair"
+            - "T1_T1Gd"
+            - "--iters"
+            - "100000"
+            - "--lr"
+            - "1e-5"
+            - "--num_channels"
+            - "32"
+            - "--grad_accum"
+            - "4"
+            - "--data_dir"
+            - "/pvc/data/brats23/train_full"
+            - "--save_dir"
+            - "/pvc/checkpoints/t1_t1gd_full"
+            - "--repo_dir"
+            - "/app/fast-cwdm"
+            - "--log_every"
+            - "100"
+            - "--val_every"
+            - "5000"
+            - "--save_every"
+            - "10000"
+            - "--num_workers"
+            - "4"
+            # Uncomment to resume:
+            # - "--resume"
+            # - "/pvc/checkpoints/t1_t1gd_full/checkpoint_t1_t1gd_iter0100000.pt"
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "UTF-8"
+            - name: WANDB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: wandb-secret
+                  key: api-key
+            - name: WANDB_PROJECT
+              value: "bidirectional-mri-synthesis"
+            # Optional: set your WandB team
+            # - name: WANDB_ENTITY
+            #   value: "your-wandb-username"
+
+          resources:
+            requests:
+              memory: "60Gi"
+              cpu: "12"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "64Gi"
+              cpu: "12"
+              nvidia.com/gpu: "1"
+
+          volumeMounts:
+            - name: brats23-vol
+              mountPath: /pvc
+            - name: dshm
+              mountPath: /dev/shm
+
+      volumes:
+        - name: brats23-vol
+          persistentVolumeClaim:
+            claimName: brats23-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

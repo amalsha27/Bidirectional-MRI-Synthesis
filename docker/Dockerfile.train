@@ -1,0 +1,46 @@
+# =============================================================================
+# Bidirectional MRI Synthesis — Training Image
+# Pushed to: ghcr.io/amalsha27/bidirectional-mri-synthesis:latest
+#
+# Build & push:
+#   docker build -t ghcr.io/amalsha27/bidirectional-mri-synthesis:latest \
+#       -f docker/Dockerfile.train .
+#   docker push ghcr.io/amalsha27/bidirectional-mri-synthesis:latest
+#
+# On Nautilus NRP (via K8s Job):
+#   kubectl apply -f nautilius/jobs/train-t1-t1gd-full.yaml
+# =============================================================================
+
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+LABEL org.opencontainers.image.description="Bidirectional MRI Synthesis training image (BraTS23, fast-cWDM)"
+
+# ── System deps ────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Clone fast-cwdm (model + diffusion code) ──────────────────────────────────
+RUN git clone https://github.com/tsereda/fast-cwdm.git /app/fast-cwdm
+
+# ── Python deps ────────────────────────────────────────────────────────────────
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Copy project scripts ───────────────────────────────────────────────────────
+COPY scripts/ /app/scripts/
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# fast-cwdm importable as a package; /app for any top-level modules
+ENV PYTHONPATH="/app/fast-cwdm:/app"
+ENV PYTHONUNBUFFERED=1
+
+# PVC is mounted at /pvc by the K8s job — data and checkpoints live there.
+# Default: train T1<->T1Gd. Override CMD or args in the K8s job spec.
+ENTRYPOINT ["python", "/app/scripts/train_option2.py"]
+CMD ["--pair", "T1_T1Gd", "--iters", "100000", \
+     "--data_dir", "/pvc/data/brats23/train", \
+     "--save_dir", "/pvc/checkpoints/t1_t1gd"]
