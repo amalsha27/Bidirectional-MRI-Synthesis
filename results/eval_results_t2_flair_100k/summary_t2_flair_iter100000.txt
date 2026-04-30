@@ -1,0 +1,9 @@
+Fast-cWDM Option 2 -- T2_FLAIR
+Checkpoint iteration : 100000
+DDIM steps           : 100
+Subjects evaluated   : 105 (test set)
+
+Direction    MSE (x10^-3)       PSNR (dB)        SSIM
+--------------------------------------------------------------
+A            2.934 +/- 2.343   26.01 +/- 2.13   0.8858 +/- 0.0318
+B            3.116 +/- 2.144   25.73 +/- 2.23   0.8509 +/- 0.0391

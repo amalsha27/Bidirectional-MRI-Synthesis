@@ -1,0 +1,64 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fast-cwdm-plot-loss
+  namespace: gai-lina-group
+  labels:
+    app: fast-cwdm
+    task: plot-loss
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fast-cwdm
+        task: plot-loss
+    spec:
+      restartPolicy: Never
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      containers:
+        - name: plotter
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "UTF-8"
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "=== Installing dependencies (CPU-only torch) ==="
+              pip install -q matplotlib numpy torch --index-url https://download.pytorch.org/whl/cpu
+
+              echo "=== Running loss curve generator ==="
+              python /pvc/scripts/plot_loss.py \
+                --t1_ckpt  /pvc/checkpoints/t1_t1gd_full/checkpoint_t1_t1gd_iter0100000.pt \
+                --t2_ckpt  /pvc/checkpoints/t2_flair_full/checkpoint_t2_flair_iter0100000.pt \
+                --save_dir /pvc/results
+
+              echo "=== Done. PNG files in /pvc/results: ==="
+              ls -lah /pvc/results/*.png
+
+          volumeMounts:
+            - name: brats23-vol
+              mountPath: /pvc
+
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "12Gi"
+              cpu: "4"
+
+      volumes:
+        - name: brats23-vol
+          persistentVolumeClaim:
+            claimName: brats23-pvc

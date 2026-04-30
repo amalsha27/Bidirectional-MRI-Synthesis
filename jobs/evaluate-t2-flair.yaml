@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fast-cwdm-eval-t2-flair
+  namespace: gai-lina-group
+  labels:
+    app: fast-cwdm
+    task: eval
+    pair: t2-flair
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fast-cwdm
+        task: eval
+        pair: t2-flair
+    spec:
+      restartPolicy: Never
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+
+      containers:
+        - name: evaluator
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "UTF-8"
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "=== Installing dependencies ==="
+              pip install -q nibabel blobfile scikit-learn tqdm scikit-image matplotlib wandb
+
+              echo "=== Cloning fast-cwdm repo ==="
+              git clone https://github.com/tsereda/fast-cwdm.git /tmp/fast-cwdm
+
+              echo "=== Checking GPU ==="
+              python -c "
+              import torch
+              print(f'PyTorch  : {torch.__version__}')
+              print(f'GPU      : {torch.cuda.get_device_name(0)}')
+              free, total = torch.cuda.mem_get_info()
+              print(f'VRAM     : {free/1e9:.1f} GB free / {total/1e9:.1f} GB total')
+              "
+
+              echo "=== Listing available checkpoints ==="
+              ls -lah /pvc/checkpoints/ | grep t2_flair || echo "No T2/FLAIR checkpoints found yet"
+
+              echo "=== Copying evaluation script ==="
+              cp /pvc/scripts/evaluate_option2.py /tmp/fast-cwdm/evaluate_option2.py
+
+              echo "=== Running evaluation: T2 <-> FLAIR ==="
+              python /tmp/fast-cwdm/evaluate_option2.py \
+                --pair         T2_FLAIR \
+                --checkpoint   /pvc/checkpoints/t2_flair_full/checkpoint_t2_flair_iter0100000.pt \
+                --data_dir     /pvc/data/brats23/train \
+                --save_dir     /pvc/results/eval_t2_flair_100k \
+                --repo_dir     /tmp/fast-cwdm \
+                --num_subjects 105 \
+                --ddim_steps   100
+
+              echo "=== Evaluation complete ==="
+              echo "Results saved to /pvc/results:"
+              ls -lah /pvc/results/
+
+          volumeMounts:
+            - name: brats23-vol
+              mountPath: /pvc
+            - name: shm
+              mountPath: /dev/shm
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "12"
+              nvidia.com/gpu: "1"
+
+      volumes:
+        - name: brats23-vol
+          persistentVolumeClaim:
+            claimName: brats23-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi

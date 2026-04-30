@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: team-u16-mri-synth-script-uploader
+  namespace: gai-lina-group
+spec:
+  restartPolicy: Never
+  containers:
+    - name: uploader
+      image: ubuntu:22.04
+      command: ["bash", "-lc", "sleep infinity"]
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+      volumeMounts:
+        - name: brats23-vol
+          mountPath: /pvc
+  volumes:
+    - name: brats23-vol
+      persistentVolumeClaim:
+        claimName: brats23-pvc

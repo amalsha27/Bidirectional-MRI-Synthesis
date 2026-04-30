@@ -1,0 +1,52 @@
+=================================================================
+  BraTS 2023 GLI — EDA Summary Report
+  Fast-cWDM Option 2 | CSC 792 | Univ. of South Dakota
+=================================================================
+
+Data directory  : /pvc/data/brats23/train
+Save directory  : /pvc/results/EDA
+
+── COMPLETENESS ──────────────────────────────────────────────
+  Total folders    : 1044
+  Complete (4/4)   : 1044
+  Incomplete       : 0
+  Missing modality : {}
+
+── VOLUME SHAPE & SPACING ────────────────────────────────────
+  Unique shapes    : {(240, 240, 155): 50}
+  Unique spacings  : {(1.0, 1.0, 1.0): 50}
+  Preprocessing    : (240,240,155) → center-crop → (224,224,160)
+
+── INTENSITY STATISTICS (foreground, 100 subjects) ──────────────
+  Modality     Mean      Std      Min        Max      p99
+  ----------------------------------------------------
+  T1          693.2    154.9     29.1     2007.7   1025.1
+  T1Gd       1474.1    481.5     67.6     7752.4   3264.3
+  T2          616.0    275.2      9.3     2421.6   1618.3
+  FLAIR       688.1    245.5     17.3     2053.7   1383.2
+
+── MODALITY PAIR CORRELATIONS ────────────────────────────────
+  T1_T1Gd              Pearson r = 0.4534
+  T2_FLAIR             Pearson r = -0.0946
+
+── TRAIN / VAL / TEST SPLIT (random_state=42) ────────────────
+  Train :  835 subjects  (1670 training examples/model)
+  Val   :  104 subjects  (208 validation examples/model)
+  Test  :  105 subjects  (210 test examples/model)
+
+── OUTPUT FILES ──────────────────────────────────────────────
+  01_completeness.png
+  02_intensity_boxplot.png
+  03_histograms.png
+  04_axial_slices.png
+  05_three_planes.png
+  06_before_after_norm.png
+  07_correlations.png
+  08_dwt_subbands.png
+  08b_dwt_energy.png
+  09_split_pie.png
+  stats_intensity.csv
+  split_subjects.json
+  summary_eda.txt
+
+=================================================================

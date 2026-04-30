@@ -1,0 +1,9 @@
+Fast-cWDM Option 2 -- T1_T1Gd
+Checkpoint iteration : 100000
+DDIM steps           : 100
+Subjects evaluated   : 105 (test set)
+
+Direction    MSE (x10^-3)       PSNR (dB)        SSIM
+--------------------------------------------------------------
+A            2.750 +/- 1.048   25.88 +/- 1.49   0.8912 +/- 0.0259
+B            4.510 +/- 5.348   24.78 +/- 2.80   0.8548 +/- 0.0432
