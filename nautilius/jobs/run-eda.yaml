@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fast-cwdm-eda
+  namespace: gai-lina-group
+  labels:
+    app: fast-cwdm
+    task: eda
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: fast-cwdm
+        task: eda
+    spec:
+      restartPolicy: Never
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+
+      containers:
+        - name: eda
+          image: gitlab-registry.nrp-nautilus.io/prp/jupyter-stack/prp
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "UTF-8"
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "=== Installing dependencies ==="
+              pip install -q nibabel scikit-learn tqdm matplotlib PyWavelets
+
+              echo "=== Creating EDA output directory ==="
+              mkdir -p /pvc/results/EDA
+
+              echo "=== Copying EDA script ==="
+              cp /pvc/scripts/eda_brats.py /tmp/eda_brats.py
+
+              echo "=== Running EDA ==="
+              python /tmp/eda_brats.py \
+                --data_dir  /pvc/data/brats23/train \
+                --save_dir  /pvc/results/EDA \
+                --n_stats   100 \
+                --n_viz     6 \
+                --n_corr    30
+
+              echo "=== EDA complete — listing outputs ==="
+              ls -lah /pvc/results/EDA/
+
+          volumeMounts:
+            - name: brats23-vol
+              mountPath: /pvc
+            - name: shm
+              mountPath: /dev/shm
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "8"
+            limits:
+              memory: "48Gi"
+              cpu: "12"
+
+      volumes:
+        - name: brats23-vol
+          persistentVolumeClaim:
+            claimName: brats23-pvc
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
