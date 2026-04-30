@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Data & checkpoints (too large for git)
+data/
+checkpoints/*.pth
+checkpoints/*.pt
+results/
+
+# Keep placeholder files
+!checkpoints/.gitkeep
+!data/.gitkeep
+!results/.gitkeep
+
+# Docker
+docker/weights/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

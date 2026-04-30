@@ -1,0 +1,466 @@
+"""
+evaluate_option2.py
+Fast-cWDM -- Option 2 Bidirectional MRI Synthesis -- Evaluation
+CSC 792 | University of South Dakota | Dr. Lina Chato
+
+Loads a saved checkpoint and evaluates synthesis quality on the validation set.
+
+Outputs (all saved to --save_dir):
+  metrics_<pair>_dir<A|B>.csv   per-subject MSE, PSNR, SSIM
+  summary_<pair>.txt            mean +/- std for each metric, both directions
+  loss_curve_<pair>.png         training and validation loss curves
+  slices_<pair>/                sample PNG comparisons (synthesis vs real vs diff)
+  synthesis_<pair>/             synthesised NIfTI volumes
+
+Usage:
+  python evaluate_option2.py --pair T1_T1Gd \
+      --checkpoint /pvc/checkpoints/checkpoint_t1_t1gd_iter0100000.pt \
+      --data_dir   /pvc/data/brats23/train \
+      --save_dir   /pvc/results \
+      --repo_dir   /tmp/fast-cwdm \
+      --num_subjects 20 \
+      --ddim_steps   100
+
+  python evaluate_option2.py --pair T2_FLAIR \
+      --checkpoint /pvc/checkpoints/checkpoint_t2_flair_iter0100000.pt \
+      --data_dir   /pvc/data/brats23/train \
+      --save_dir   /pvc/results \
+      --repo_dir   /tmp/fast-cwdm
+
+Resume training from 100k to 600k (run separately in training job):
+  python train_option2.py --pair T1_T1Gd --iters 600000 \
+      --resume /pvc/checkpoints/checkpoint_t1_t1gd_iter0100000.pt
+"""
+
+import argparse, os, sys, glob, csv
+import numpy as np
+import nibabel
+import torch
+import torch.nn.functional as F
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+from skimage.metrics import structural_similarity as ssim_fn
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument('--pair',         default='T1_T1Gd', choices=['T1_T1Gd', 'T2_FLAIR'])
+parser.add_argument('--checkpoint',   required=True)
+parser.add_argument('--data_dir',
+    default='/pvc/data/brats23/train')
+parser.add_argument('--save_dir',     default='/pvc/results')
+parser.add_argument('--repo_dir',     default='/tmp/fast-cwdm')
+parser.add_argument('--num_subjects', type=int, default=20,
+    help='Number of validation subjects to evaluate (default 20, -1 = all)')
+parser.add_argument('--ddim_steps',   type=int, default=100,
+    help='Number of denoising steps for inference (fewer = faster, lower quality)')
+args = parser.parse_args()
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+sys.path.insert(0, args.repo_dir)
+os.makedirs(args.save_dir, exist_ok=True)
+os.makedirs(os.path.join(args.save_dir, f'slices_{args.pair.lower()}'), exist_ok=True)
+os.makedirs(os.path.join(args.save_dir, f'synthesis_{args.pair.lower()}'), exist_ok=True)
+
+from guided_diffusion.bratsloader import clip_and_normalize
+from guided_diffusion.script_util import create_model_and_diffusion
+from guided_diffusion import dist_util
+from DWT_IDWT.DWT_IDWT_layer import DWT_3D, IDWT_3D
+
+dist_util.setup_dist(devices=[0])
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Device : {device}')
+if device.type == 'cuda':
+    print(f'GPU    : {torch.cuda.get_device_name(0)}')
+    free, total = torch.cuda.mem_get_info()
+    print(f'VRAM   : {free/1e9:.1f} GB free / {total/1e9:.1f} GB total')
+
+# ── DWT helpers — always float32 ──────────────────────────────────────────────
+_dwt  = DWT_3D('haar').to(device)
+_idwt = IDWT_3D('haar').to(device)
+
+def dwt_8ch(vol):
+    """vol: (1,1,H,W,D) float32 -> (1,8,H/2,W/2,D/2) float32"""
+    if vol is None or vol.abs().sum() == 0:
+        B, _, H, W, D = vol.shape
+        return torch.zeros(B, 8, H//2, W//2, D//2, device=device)
+    LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH = _dwt(vol.float().to(device))
+    return torch.cat([LLL/3., LLH, LHL, LHH, HLL, HLH, HHL, HHH], dim=1)
+
+def idwt_from_8ch(pred):
+    """pred: (1,8,H,W,D) float32 -> (1,1,H*2,W*2,D*2) float32"""
+    LLL = pred[:, 0:1] * 3.0   # undo the /3 applied during DWT
+    LLH = pred[:, 1:2]
+    LHL = pred[:, 2:3]
+    LHH = pred[:, 3:4]
+    HLL = pred[:, 4:5]
+    HLH = pred[:, 5:6]
+    HHL = pred[:, 6:7]
+    HHH = pred[:, 7:8]
+    return _idwt(LLL.float(), LLH.float(), LHL.float(), LHH.float(),
+                 HLL.float(), HLH.float(), HHL.float(), HHH.float())
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+ALL_KEYS  = ['t1n', 't1c', 't2w', 't2f']
+VOL_SHAPE = (1, 224, 224, 160)
+
+def load_vol(sample_dir, key):
+    paths = glob.glob(str(Path(sample_dir) / f'*-{key}.nii.gz'))
+    if not paths:
+        return torch.zeros(*VOL_SHAPE)
+    try:
+        vol = nibabel.load(paths[0]).get_fdata()
+    except Exception as e:
+        print(f'WARNING: failed to load {paths[0]}: {e}', flush=True)
+        return torch.zeros(*VOL_SHAPE)
+    vol = clip_and_normalize(vol)
+    t   = torch.zeros(1, 240, 240, 160)
+    t[:, :, :, :155] = torch.tensor(vol).float()
+    return t[:, 8:-8, 8:-8, :].float()   # (1, 224, 224, 160)
+
+def get_pair_samples(data_dir, key_a, key_b):
+    complete = []
+    for d in sorted(Path(data_dir).iterdir()):
+        if not d.is_dir():
+            continue
+        has_a = len(glob.glob(str(d / f'*-{key_a}.nii.gz'))) > 0
+        has_b = len(glob.glob(str(d / f'*-{key_b}.nii.gz'))) > 0
+        if has_a and has_b:
+            complete.append(str(d))
+    return complete
+
+# ── Model config (must match training) ───────────────────────────────────────
+MODEL_CONFIG = dict(
+    image_size           = 224,
+    num_channels         = 32,
+    num_res_blocks       = 2,
+    channel_mult         = '1,2,2,4,4',
+    learn_sigma          = False,
+    class_cond           = False,
+    use_checkpoint       = True,
+    attention_resolutions= '',
+    num_heads            = 1,
+    num_head_channels    = -1,
+    num_heads_upsample   = -1,
+    use_scale_shift_norm = False,
+    dropout              = 0.0,
+    resblock_updown      = True,
+    use_fp16             = False,
+    use_new_attention_order = False,
+    dims                 = 3,
+    num_groups           = 32,
+    in_channels          = 32,
+    out_channels         = 8,
+    bottleneck_attention = False,
+    resample_2d          = False,
+    additive_skips       = False,
+    use_freq             = False,
+    diffusion_steps      = 1000,
+    noise_schedule       = 'linear',
+    timestep_respacing   = '',
+    use_kl               = False,
+    predict_xstart       = True,
+    rescale_timesteps    = False,
+    rescale_learned_sigmas = False,
+    dataset              = 'brats',
+    mode                 = 'i2i',
+    sample_schedule      = 'direct',
+)
+
+# ── DDIM sampling ─────────────────────────────────────────────────────────────
+def ddim_sample(model, diffusion, cond, num_steps=100):
+    """
+    DDIM deterministic sampling in wavelet space.
+
+    cond   : (1, 24, 112, 112, 80) float32 -- three condition modalities DWT
+    Returns: (1,  8, 112, 112, 80) float32 -- synthesised target DWT
+
+    With predict_xstart=True the model directly predicts x0.
+    DDIM update: x_{t-1} = sqrt(a_{t-1}) * pred_x0
+                           + sqrt(1 - a_{t-1}) * (x_t - sqrt(a_t)*pred_x0) / sqrt(1-a_t)
+    This is deterministic (no added noise) and greatly reduces the number of
+    function evaluations needed to produce a good sample.
+    """
+    T    = diffusion.num_timesteps   # 1000
+    step = max(1, T // num_steps)
+    # Timestep sequence from T-1 down to 0 in num_steps steps
+    ts   = list(range(0, T, step))[::-1]
+
+    # Pre-fetch alpha_cumprod to CPU numpy for indexing speed
+    acp  = torch.from_numpy(diffusion.alphas_cumprod).float().to(device)
+
+    H, W, D = cond.shape[2], cond.shape[3], cond.shape[4]
+    x = torch.randn(1, 8, H, W, D, device=device)
+
+    model.eval()
+    with torch.no_grad():
+        for i, t_val in enumerate(ts):
+            t_tensor = torch.tensor([t_val], device=device)
+            x_input  = torch.cat([x, cond], dim=1)        # (1, 32, ...)
+            pred_x0  = model(x_input, t_tensor).float()   # (1, 8, ...)
+
+            if i == len(ts) - 1:
+                x = pred_x0
+            else:
+                t_prev    = ts[i + 1]
+                a_t       = acp[t_val].sqrt()
+                a_prev    = acp[t_prev].sqrt()
+                s_t       = (1 - acp[t_val]).sqrt()
+                s_prev    = (1 - acp[t_prev]).sqrt()
+                # Estimated noise direction
+                eps       = (x - a_t * pred_x0) / s_t
+                x         = a_prev * pred_x0 + s_prev * eps
+
+    return x
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+def compute_metrics(pred_vol, real_vol):
+    """
+    pred_vol, real_vol: (1, 224, 224, 160) float32 tensors in [0,1].
+    Returns dict with mse, psnr, ssim.
+    Metrics are computed in voxel space matching the paper's evaluation.
+    """
+    p = pred_vol.squeeze().cpu().numpy().astype(np.float64)
+    r = real_vol.squeeze().cpu().numpy().astype(np.float64)
+    p = np.clip(p, 0.0, 1.0)
+
+    mse  = float(np.mean((p - r) ** 2))
+    psnr = float(10 * np.log10(1.0 / mse)) if mse > 0 else 100.0
+
+    # SSIM on middle 80% of slices (avoid padded edges), computed slice-by-slice
+    z_start = int(0.1 * r.shape[2])
+    z_end   = int(0.9 * r.shape[2])
+    ssim_vals = []
+    for z in range(z_start, z_end):
+        s = ssim_fn(p[:, :, z], r[:, :, z], data_range=1.0)
+        ssim_vals.append(s)
+    ssim = float(np.mean(ssim_vals))
+
+    return {'mse': mse, 'psnr': psnr, 'ssim': ssim}
+
+# ── Slice comparison PNG ──────────────────────────────────────────────────────
+def save_slice_comparison(pred_vol, real_vol, subject_name, direction, save_dir, pair):
+    """Save a 4-panel comparison: synthesis | real | difference | overlay."""
+    z = real_vol.shape[3] // 2   # middle axial slice
+    p = pred_vol.squeeze().cpu().numpy()[:, :, z]
+    r = real_vol.squeeze().cpu().numpy()[:, :, z]
+    diff = np.abs(p - r)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig.suptitle(f'{subject_name} | {pair} | Direction {direction} | Slice {z}',
+                 fontsize=10)
+
+    axes[0].imshow(p.T, cmap='gray', vmin=0, vmax=1, origin='lower')
+    axes[0].set_title('Synthesis')
+    axes[0].axis('off')
+
+    axes[1].imshow(r.T, cmap='gray', vmin=0, vmax=1, origin='lower')
+    axes[1].set_title('Real')
+    axes[1].axis('off')
+
+    im = axes[2].imshow(diff.T, cmap='hot', vmin=0, vmax=0.3, origin='lower')
+    axes[2].set_title('Difference')
+    axes[2].axis('off')
+    plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    overlay = np.stack([
+        np.clip(r.T + diff.T, 0, 1),
+        np.clip(r.T, 0, 1),
+        np.clip(r.T, 0, 1)
+    ], axis=-1)
+    axes[3].imshow(overlay, origin='lower')
+    axes[3].set_title('Overlay')
+    axes[3].axis('off')
+
+    plt.tight_layout()
+    out_path = os.path.join(
+        save_dir, f'slices_{pair.lower()}',
+        f'{subject_name}_dir{direction}.png')
+    plt.savefig(out_path, dpi=120, bbox_inches='tight')
+    plt.close()
+
+# ── Loss curve plot ───────────────────────────────────────────────────────────
+def plot_loss_curves(history, pair, save_dir, checkpoint_path):
+    """Plot training and validation loss from checkpoint history dict."""
+    ti = history.get('train_iters',  [])
+    tl = history.get('train_losses', [])
+    vi = history.get('val_iters',    [])
+    vl = history.get('val_losses',   [])
+
+    if not ti:
+        print('No loss history found in checkpoint, skipping loss curve plot.')
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(ti, tl, label='Train loss (wavelet MSE)', color='steelblue', linewidth=1)
+    if vi:
+        ax.plot(vi, vl, label='Val loss (wavelet MSE)',   color='darkorange',
+                linewidth=1.5, marker='o', markersize=3)
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('MSE (wavelet domain)')
+    ax.set_title(f'Fast-cWDM Option 2 -- {pair} -- Training Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    iter_label = os.path.basename(checkpoint_path).replace('.pt', '')
+    out_path = os.path.join(save_dir, f'loss_curve_{pair.lower()}_{iter_label}.png')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f'Loss curve saved: {out_path}')
+
+# ── Main evaluation ───────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    # Pair-specific keys and directions
+    if args.pair == 'T1_T1Gd':
+        ka, kb = 't1n', 't1c'
+        directions = [
+            ('A', 't1n', ['t1c', 't2w', 't2f']),   # synthesise T1,    given T1Gd+T2+FLAIR
+            ('B', 't1c', ['t1n', 't2w', 't2f']),   # synthesise T1Gd,  given T1+T2+FLAIR
+        ]
+    else:
+        ka, kb = 't2w', 't2f'
+        directions = [
+            ('A', 't2w', ['t2f', 't1n', 't1c']),   # synthesise T2,    given FLAIR+T1+T1Gd
+            ('B', 't2f', ['t2w', 't1n', 't1c']),   # synthesise FLAIR, given T2+T1+T1Gd
+        ]
+
+    # Dataset: same split as training (random_state=42 ensures consistency)
+    samples          = []
+    for d in sorted(Path(args.data_dir).iterdir()):
+        if not d.is_dir():
+            continue
+        has_a = len(glob.glob(str(d / f'*-{ka}.nii.gz'))) > 0
+        has_b = len(glob.glob(str(d / f'*-{kb}.nii.gz'))) > 0
+        if has_a and has_b:
+            samples.append(str(d))
+
+    _, valtest   = train_test_split(samples, test_size=0.2, random_state=42)
+    val_s, test_s = train_test_split(valtest, test_size=0.5, random_state=42)
+
+    # Use the held-out TEST set (never seen during training or validation)
+    eval_s = test_s
+    if args.num_subjects > 0:
+        eval_s = eval_s[:args.num_subjects]
+    print(f'Pair={args.pair}  Evaluating on {len(eval_s)} TEST subjects '
+          f'(total test pool: {len(test_s)})')
+
+    # Load model
+    model, diffusion = create_model_and_diffusion(**MODEL_CONFIG)
+    model.to(device)
+    diffusion.mode = 'i2i'
+
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt['model'])
+    iteration = ckpt.get('iteration', ckpt.get('epoch', '?'))
+    history   = ckpt.get('history', {})
+    print(f'Checkpoint loaded: iteration {iteration}')
+    print(f'Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
+
+    # Plot loss curves from checkpoint history
+    plot_loss_curves(history, args.pair, args.save_dir, args.checkpoint)
+
+    # Evaluate each direction
+    all_results = {}
+
+    for dir_label, tgt_key, cond_keys in directions:
+        print(f'\n--- Direction {dir_label}: synthesise {tgt_key} '
+              f'given {cond_keys} ---')
+
+        rows = []   # list of dicts: subject, mse, psnr, ssim
+
+        for subj_idx, subj_dir in enumerate(eval_s):
+            subj_name = Path(subj_dir).name
+            print(f'  [{subj_idx+1}/{len(val_s)}] {subj_name}', end=' ', flush=True)
+
+            # Load all modalities (unsqueeze to add batch dim)
+            vols = {k: load_vol(subj_dir, k).unsqueeze(0) for k in ALL_KEYS}
+            # (1, 1, 224, 224, 160) per modality
+
+            real_vol = vols[tgt_key]   # ground truth target
+            if real_vol.abs().sum() == 0:
+                print('-> target missing, skip')
+                continue
+
+            # Build condition tensor (24 channels)
+            cond = torch.cat(
+                [dwt_8ch(vols[k]) for k in cond_keys], dim=1
+            )  # (1, 24, 112, 112, 80)
+
+            # Run DDIM inference
+            pred_dwt = ddim_sample(model, diffusion, cond,
+                                   num_steps=args.ddim_steps)  # (1, 8, ...)
+
+            # Reconstruct voxel-space volume via IDWT
+            pred_vol = idwt_from_8ch(pred_dwt)  # (1, 1, 224, 224, 160)
+            pred_vol = pred_vol.clamp(0.0, 1.0)
+
+            # Compute metrics (voxel space, matching paper's evaluation)
+            m = compute_metrics(pred_vol, real_vol)
+            rows.append({'subject': subj_name, **m})
+            print(f'MSE={m["mse"]*1e3:.3f}e-3  PSNR={m["psnr"]:.2f}dB  '
+                  f'SSIM={m["ssim"]:.4f}')
+
+            # Save slice comparison (first 5 subjects only to save disk space)
+            if subj_idx < 5:
+                save_slice_comparison(
+                    pred_vol.squeeze(0), real_vol.squeeze(0),
+                    subj_name, dir_label, args.save_dir, args.pair)
+
+            # Save synthesised NIfTI
+            pred_np = pred_vol.squeeze().cpu().numpy()
+            nii_out = nibabel.Nifti1Image(pred_np, np.eye(4))
+            nii_path = os.path.join(
+                args.save_dir, f'synthesis_{args.pair.lower()}',
+                f'{subj_name}_{tgt_key}_pred.nii.gz')
+            nibabel.save(nii_out, nii_path)
+
+        # Write per-subject CSV
+        csv_path = os.path.join(
+            args.save_dir,
+            f'metrics_{args.pair.lower()}_dir{dir_label}.csv')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['subject','mse','psnr','ssim'])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        all_results[dir_label] = rows
+
+        # Summary statistics
+        if rows:
+            mses  = [r['mse']  for r in rows]
+            psnrs = [r['psnr'] for r in rows]
+            ssims = [r['ssim'] for r in rows]
+            print(f'\n  Direction {dir_label} summary ({len(rows)} subjects):')
+            print(f'    MSE  : {np.mean(mses)*1e3:.3f} +/- {np.std(mses)*1e3:.3f} (x10^-3)')
+            print(f'    PSNR : {np.mean(psnrs):.2f} +/- {np.std(psnrs):.2f} dB')
+            print(f'    SSIM : {np.mean(ssims):.4f} +/- {np.std(ssims):.4f}')
+
+    # Write combined summary text file
+    summary_path = os.path.join(args.save_dir,
+                                f'summary_{args.pair.lower()}_iter{iteration}.txt')
+    with open(summary_path, 'w') as f:
+        f.write(f'Fast-cWDM Option 2 -- {args.pair}\n')
+        f.write(f'Checkpoint iteration : {iteration}\n')
+        f.write(f'DDIM steps           : {args.ddim_steps}\n')
+        f.write(f'Subjects evaluated   : {len(eval_s)} (test set)\n\n')
+        f.write(f'{"Direction":<12} {"MSE (x10^-3)":<18} {"PSNR (dB)":<16} {"SSIM"}\n')
+        f.write('-' * 62 + '\n')
+        for dir_label, _, tgt_key in [(d[0], d[1], d[1]) for d in directions]:
+            rows = all_results.get(dir_label, [])
+            if not rows:
+                continue
+            mses  = [r['mse']  for r in rows]
+            psnrs = [r['psnr'] for r in rows]
+            ssims = [r['ssim'] for r in rows]
+            line  = (f'{dir_label:<12} '
+                     f'{np.mean(mses)*1e3:.3f} +/- {np.std(mses)*1e3:.3f}   '
+                     f'{np.mean(psnrs):.2f} +/- {np.std(psnrs):.2f}   '
+                     f'{np.mean(ssims):.4f} +/- {np.std(ssims):.4f}')
+            f.write(line + '\n')
+
+    print(f'\nSummary saved: {summary_path}')
+    print(f'All results in: {args.save_dir}')
+    print('Done.')

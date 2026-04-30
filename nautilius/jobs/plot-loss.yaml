@@ -1,0 +1,65 @@
+# =============================================================================
+# Plot-Loss Job — generates loss curve PNGs from checkpoints (CPU only)
+#
+#   kubectl apply -f nautilius/jobs/plot-loss.yaml -n gai-lina-group
+#   kubectl logs -f job/bidi-mri-plot-loss -n gai-lina-group
+# =============================================================================
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bidi-mri-plot-loss
+  namespace: gai-lina-group
+  labels:
+    app: bidirectional-mri-synthesis
+    task: plot-loss
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: bidirectional-mri-synthesis
+        task: plot-loss
+    spec:
+      restartPolicy: Never
+
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+
+      containers:
+        - name: plotter
+          image: ghcr.io/amalsha27/bidirectional-mri-synthesis:latest
+          imagePullPolicy: Always
+
+          command: ["python", "/app/scripts/plot_loss.py"]
+          args:
+            - "--t1_ckpt"
+            - "/pvc/checkpoints/t1_t1gd_full/checkpoint_t1_t1gd_iter0100000.pt"
+            - "--t2_ckpt"
+            - "/pvc/checkpoints/t2_flair_full/checkpoint_t2_flair_iter0100000.pt"
+            - "--save_dir"
+            - "/pvc/results"
+
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONIOENCODING
+              value: "UTF-8"
+
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "2"
+            limits:
+              memory: "12Gi"
+              cpu: "4"
+
+          volumeMounts:
+            - name: brats23-vol
+              mountPath: /pvc
+
+      volumes:
+        - name: brats23-vol
+          persistentVolumeClaim:
+            claimName: brats23-pvc
